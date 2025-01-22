@@ -846,6 +846,13 @@ impl InnerWebView {
       webview.AddWebResourceRequestedFilter(&filter, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)?;
     }
 
+    for name in attributes.async_custom_protocols.keys() {
+      // WebView2 supports non-standard protocols only on Windows 10+, so we have to use this workaround
+      // See https://github.com/MicrosoftEdge/WebView2Feedback/issues/73
+      let filter = HSTRING::from(format!("{scheme}://{name}.*"));
+      webview.AddWebResourceRequestedFilter(&filter, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)?;
+    }
+
     let env = env.clone();
     let custom_protocols = std::mem::take(&mut attributes.custom_protocols);
     let async_custom_protocols = std::mem::take(&mut attributes.async_custom_protocols);
