@@ -444,7 +444,7 @@ impl InnerWebView {
       .iter()
       .map(|n| n.0.clone())
       .collect();
-    if !attributes.custom_protocols.is_empty() {
+    if !attributes.custom_protocols.is_empty() || !attributes.async_custom_protocols.is_empty() {
       unsafe {
         Self::attach_custom_protocol_handler(
           &webview,
