@@ -444,13 +444,12 @@ impl InnerWebView {
       // This intentionally does not use `!is::<DataAccessPermissionRequest>` to not accidentally enable types added in the future.
       // PointerLock is enabled by default so we ignore PointerLockPermissionRequest.
       // MediaKeySystemPermissionRequest is ignored because we don't use `settings.enable_encrypted_media(true);` which requires non-default webkitgtk builds.
+      // TODO: https://webkitgtk.org/reference/webkitgtk/stable/class.GeolocationPermissionRequest.html
       if permission_request.is::<DeviceInfoPermissionRequest>()
-        // || permission_request.is::<GeolocationPermissionRequest>() TODO: https://webkitgtk.org/reference/webkitgtk/stable/class.GeolocationPermissionRequest.html
-        || permission_request.is::<MediaKeySystemPermissionRequest>()
-        // || permission_request.is::<NotificationPermissionRequest>() TODO: In Tauri we
+        || permission_request.is::<GeolocationPermissionRequest>()
         || permission_request.is::<UserMediaPermissionRequest>()
+      // || permission_request.is::<NotificationPermissionRequest>() TODO: In Tauri we polyfill this
       {
-        dbg!("true");
         permission_request.allow();
         return true;
       }

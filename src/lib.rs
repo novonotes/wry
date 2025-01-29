@@ -2161,10 +2161,27 @@ pub enum PageLoadEvent {
 pub enum BackgroundThrottlingPolicy {
   /// A policy where background throttling is disabled
   Disabled,
-  /// A policy where a web view that’s not in a window fully suspends tasks.
+  /// A policy where a web view that's not in a window fully suspends tasks.
   Suspend,
-  /// A policy where a web view that’s not in a window limits processing, but does not fully suspend tasks.
+  /// A policy where a web view that's not in a window limits processing, but does not fully suspend tasks.
   Throttle,
+}
+
+/// Permission Kind for permission_request_handler
+pub enum PermissionRequestKind {
+  /// Linux enumerateDevices
+  DeviceInfo,
+  /// Windows getUserMedia mic
+  /// Linux getUserMedia mic
+  Microphone,
+  /// Windows getUserMedia cam
+  Camera,
+  /// macOS getUserMedia TOD
+  UserMedia,
+  /// macOS
+  DisplayMedia,
+  /// Windows, macOS, Linux - may not make location apis work
+  Geolocation,
 }
 
 #[cfg(test)]

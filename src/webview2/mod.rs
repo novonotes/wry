@@ -474,10 +474,25 @@ impl InnerWebView {
           &PermissionRequestedEventHandler::create(Box::new(|_, args| {
             let Some(args) = args else { return Ok(()) };
 
+            // TODO:
+            let on_permission_request = move || true;
+
             let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
             args.PermissionKind(&mut kind)?;
             if kind == COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ {
               args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
+            } else if kind == COREWEBVIEW2_PERMISSION_KIND_CAMERA
+              || kind == COREWEBVIEW2_PERMISSION_KIND_MICROPHONE
+              || kind == COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION
+            {
+              // TODO: on_permission_request needs allow, deny, ignore (ignore == don't use SetState)
+              // TODO: Sending Deny will prevent this from being called again https://github.com/MicrosoftEdge/WebView2Feedback/issues/2672
+              // TODO(upstream): Not triggered for screen sharing https://github.com/MicrosoftEdge/WebView2Feedback/issues/2442
+              if on_permission_request() {
+                args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
+              } else {
+                args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)?;
+              }
             }
 
             Ok(())
