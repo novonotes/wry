@@ -14,7 +14,7 @@ fn main() -> wry::Result<()> {
   let window = WindowBuilder::new().build(&event_loop).unwrap();
 
   let builder = WebViewBuilder::new()
-    .with_url("http://tauri.app")
+    .with_url("https://tauri.app")
     .with_drag_drop_handler(|e| {
       match e {
         wry::DragDropEvent::Enter { paths, position } => {

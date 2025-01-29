@@ -26,10 +26,13 @@ use std::{
 #[cfg(any(debug_assertions, feature = "devtools"))]
 use webkit2gtk::WebInspectorExt;
 use webkit2gtk::{
-  AutoplayPolicy, CookieManagerExt, InputMethodContextExt, LoadEvent, NavigationPolicyDecision,
-  NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings, PolicyDecisionType,
-  PrintOperationExt, SettingsExt, URIRequest, URIRequestExt, UserContentInjectedFrames,
-  UserContentManager, UserContentManagerExt, UserScript, UserScriptInjectionTime,
+  AutoplayPolicy, CookieManagerExt, DeviceInfoPermissionRequest, GeolocationPermissionRequest,
+  InputMethodContextExt, LoadEvent, MediaKeySystemPermissionRequest, NavigationPolicyDecision,
+  NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings,
+  NotificationPermissionRequest, PermissionRequest, PermissionRequestExt,
+  PointerLockPermissionRequest, PolicyDecisionType, PrintOperationExt, SettingsExt, URIRequest,
+  URIRequestExt, UserContentInjectedFrames, UserContentManager, UserContentManagerExt,
+  UserMediaPermissionRequest, UserScript, UserScriptInjectionTime,
   WebContextExt as Webkit2gtkWeContextExt, WebView, WebViewExt, WebsiteDataManagerExt,
   WebsiteDataManagerExtManual, WebsitePolicies,
 };
@@ -378,6 +381,7 @@ impl InnerWebView {
       // Enable webgl, webaudio, canvas features as default.
       settings.set_enable_webgl(true);
       settings.set_enable_webaudio(true);
+      settings.set_enable_media_capabilities(true);
       settings
         .set_enable_back_forward_navigation_gestures(attributes.back_forward_navigation_gestures);
 
@@ -396,6 +400,9 @@ impl InnerWebView {
       if attributes.devtools {
         settings.set_enable_developer_extras(true);
       }
+
+      // TODO: put behind attributes?
+      settings.set_enable_webrtc(true);
     }
   }
 
@@ -430,6 +437,26 @@ impl InnerWebView {
         _ => (),
       });
     }
+
+    // TODO: https://github.com/tauri-apps/tauri/issues/2317 / https://github.com/tauri-apps/wry/pull/1196
+    webview.connect_permission_request(move |_webview, permission_request| {
+      // Allows everything but DataAccessPermissionRequest.
+      // This intentionally does not use `!is::<DataAccessPermissionRequest>` to not accidentally enable types added in the future.
+      // PointerLock is enabled by default so we ignore PointerLockPermissionRequest.
+      // MediaKeySystemPermissionRequest is ignored because we don't use `settings.enable_encrypted_media(true);` which requires non-default webkitgtk builds.
+      if permission_request.is::<DeviceInfoPermissionRequest>()
+        // || permission_request.is::<GeolocationPermissionRequest>() TODO: https://webkitgtk.org/reference/webkitgtk/stable/class.GeolocationPermissionRequest.html
+        || permission_request.is::<MediaKeySystemPermissionRequest>()
+        // || permission_request.is::<NotificationPermissionRequest>() TODO: In Tauri we
+        || permission_request.is::<UserMediaPermissionRequest>()
+      {
+        dbg!("true");
+        permission_request.allow();
+        return true;
+      }
+
+      false
+    });
 
     // Navigation handler && New window handler
     if attributes.navigation_handler.is_some() || attributes.new_window_req_handler.is_some() {
