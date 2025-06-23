@@ -38,16 +38,13 @@ impl GfxState {
     }))
     .expect("Failed to find an appropriate adapter");
 
-    let (device, queue) = pollster::block_on(adapter.request_device(
-      &wgpu::DeviceDescriptor {
-        label: None,
-        required_features: wgpu::Features::empty(),
-        required_limits:
-          wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
-        memory_hints: wgpu::MemoryHints::Performance,
-      },
-      None,
-    ))
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+      label: None,
+      required_features: wgpu::Features::empty(),
+      required_limits: wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+      memory_hints: wgpu::MemoryHints::Performance,
+      trace: wgpu::Trace::Off,
+    }))
     .expect("Failed to create device");
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
