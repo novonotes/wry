@@ -23,7 +23,7 @@ pub struct DocumentTitleChangedObserverIvars {
 
 define_class!(
   #[unsafe(super(NSObject))]
-  #[name = "DocumentTitleChangedObserver"]
+  #[name = env!("WRY_DOCUMENT_TITLE_CHANGED_OBSERVER_CLASS_NAME")]
   #[ivars = DocumentTitleChangedObserverIvars]
   pub struct DocumentTitleChangedObserver;
 
