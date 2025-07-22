@@ -16,7 +16,7 @@ use once_cell::sync::Lazy;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
-  core::{s, w, Interface, BOOL, HSTRING, PCWSTR, PWSTR},
+  core::{Interface, BOOL, HRESULT, HSTRING, PCSTR, PCWSTR, PWSTR},
   Win32::{
     Foundation::*,
     Globalization::*,
@@ -35,10 +35,27 @@ use crate::{
 
 type EventRegistrationToken = i64;
 
-const PARENT_SUBCLASS_ID: u32 = WM_USER + 0x64;
+// DLL識別子をビルド時に環境変数から取得
+const DLL_SUFFIX: &str = env!("WRY_DLL_ID");
+
+// サブクラスIDを動的に生成
+fn generate_dll_unique_id(base: &str) -> usize {
+  use std::hash::{Hash, Hasher};
+  use std::collections::hash_map::DefaultHasher;
+  
+  let mut hasher = DefaultHasher::new();
+  format!("{}_{}", base, DLL_SUFFIX).hash(&mut hasher);
+  hasher.finish() as usize
+}
+
+static PARENT_SUBCLASS_ID: Lazy<usize> = Lazy::new(|| generate_dll_unique_id("PARENT"));
 const PARENT_DESTROY_MESSAGE: u32 = WM_USER + 0x65;
-const MAIN_THREAD_DISPATCHER_SUBCLASS_ID: u32 = WM_USER + 0x66;
-static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| unsafe { RegisterWindowMessageA(s!("Wry::ExecMsg")) });
+static MAIN_THREAD_DISPATCHER_SUBCLASS_ID: Lazy<usize> = Lazy::new(|| generate_dll_unique_id("DISPATCHER"));
+static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| {
+  let msg_name = format!("Wry::ExecMsg::{}", DLL_SUFFIX);
+  let msg_name_cstr = std::ffi::CString::new(msg_name).unwrap();
+  unsafe { RegisterWindowMessageA(PCSTR::from_raw(msg_name_cstr.as_ptr() as *const u8)) }
+});
 
 impl From<webview2_com::Error> for Error {
   fn from(err: webview2_com::Error) -> Self {
@@ -111,7 +128,15 @@ impl InnerWebView {
     pl_attrs: super::PlatformSpecificWebViewAttributes,
     is_child: bool,
   ) -> Result<Self> {
-    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    // COM初期化（既に初期化されている場合のエラーを無視）
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr.is_ok() {
+      // S_OK
+    } else if hr == HRESULT(-2147417850) {
+      // RPC_E_CHANGED_MODE (0x80010106) - 既に別のモードで初期化済み
+    } else {
+      return Err(windows::core::Error::from(hr).into());
+    }
 
     let hwnd = Self::create_container_hwnd(parent, &attributes, is_child)?;
 
@@ -197,7 +222,9 @@ impl InnerWebView {
       DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 
-    let class_name = w!("WRY_WEBVIEW");
+    // DLLごとに一意なウィンドウクラス名
+    let class_name_str = format!("WRY_WEBVIEW_{}", DLL_SUFFIX);
+    let class_name = HSTRING::from(&class_name_str);
 
     let class = WNDCLASSEXW {
       cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -210,7 +237,7 @@ impl InnerWebView {
       hCursor: HCURSOR::default(),
       hbrBackground: HBRUSH::default(),
       lpszMenuName: PCWSTR::null(),
-      lpszClassName: class_name,
+      lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
       hIconSm: HICON::default(),
     };
 
@@ -245,7 +272,7 @@ impl InnerWebView {
     let hwnd = unsafe {
       CreateWindowExW(
         WINDOW_EX_STYLE::default(),
-        class_name,
+        PCWSTR::from_raw(class_name.as_ptr()),
         PCWSTR::null(),
         window_styles,
         x,
@@ -283,7 +310,17 @@ impl InnerWebView {
       .context
       .as_deref()
       .and_then(|context| context.data_directory())
-      .map(HSTRING::from);
+      .map(|dir| {
+        // DLLごとに分離されたデータディレクトリ
+        let path = PathBuf::from(dir);
+        if let Some(file_name) = path.file_name() {
+          let dir_name = format!("{}_{}", file_name.to_string_lossy(), DLL_SUFFIX);
+          path.with_file_name(dir_name)
+        } else {
+          path
+        }
+      })
+      .map(|path| HSTRING::from(path.to_string_lossy().as_ref()));
 
     // additional browser args
     let additional_browser_args = pl_attrs.additional_browser_args.unwrap_or_else(|| {
@@ -1101,7 +1138,7 @@ impl InnerWebView {
     let _ = SetWindowSubclass(
       hwnd,
       Some(Self::main_thread_dispatcher_proc),
-      MAIN_THREAD_DISPATCHER_SUBCLASS_ID as _,
+      *MAIN_THREAD_DISPATCHER_SUBCLASS_ID,
       0,
     );
   }
@@ -1173,7 +1210,7 @@ impl InnerWebView {
           let _ = SetWindowSubclass(
             hwnd,
             Some(Self::parent_subclass_proc),
-            PARENT_SUBCLASS_ID as _,
+            *PARENT_SUBCLASS_ID,
             std::ptr::null::<()>() as _,
           );
         }
@@ -1190,7 +1227,7 @@ impl InnerWebView {
     let _ = SetWindowSubclass(
       parent,
       Some(Self::parent_subclass_proc),
-      PARENT_SUBCLASS_ID as _,
+      *PARENT_SUBCLASS_ID,
       Box::into_raw(Box::new(controller.clone())) as _,
     );
   }
@@ -1201,7 +1238,7 @@ impl InnerWebView {
     let _ = RemoveWindowSubclass(
       parent,
       Some(Self::parent_subclass_proc),
-      PARENT_SUBCLASS_ID as _,
+      *PARENT_SUBCLASS_ID,
     );
   }
 

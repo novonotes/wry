@@ -66,6 +66,9 @@ impl DragDropController {
   #[inline]
   fn inject_in_hwnd(&mut self, hwnd: HWND, handler: Rc<dyn Fn(DragDropEvent) -> bool>) -> bool {
     let drag_drop_target: IDropTarget = DragDropTarget::new(hwnd, handler).into();
+    // WARNING: 同じHWNDに対して複数のDLLがRegisterDragDropを呼ぶと
+    // 最後に登録したもののみが有効になります。これによりドラッグ&ドロップ
+    // ハンドラが予期せず上書きされる可能性があります。
     if unsafe { RevokeDragDrop(hwnd) } != Err(DRAGDROP_E_INVALIDHWND.into())
       && unsafe { RegisterDragDrop(hwnd, &drag_drop_target) }.is_ok()
     {
