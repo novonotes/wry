@@ -43,6 +43,7 @@ pub(crate) struct DragDropController {
 impl DragDropController {
   #[inline]
   pub(crate) fn new(hwnd: HWND, handler: Box<dyn Fn(DragDropEvent) -> bool>) -> Self {
+    log::debug!("[wry] DragDropController::new - hwnd: {:?}", hwnd);
     let mut controller = DragDropController::default();
 
     let handler = Rc::new(handler);
@@ -59,20 +60,28 @@ impl DragDropController {
       }
       let _ = unsafe { EnumChildWindows(Some(hwnd), Some(enumerate_callback), lparam) };
     }
-
+    
+    log::debug!("[wry] DragDropController created with {} drop targets", controller.drop_targets.len());
     controller
   }
 
   #[inline]
   fn inject_in_hwnd(&mut self, hwnd: HWND, handler: Rc<dyn Fn(DragDropEvent) -> bool>) -> bool {
+    log::debug!("[wry] DragDropController::inject_in_hwnd - hwnd: {:?}", hwnd);
     let drag_drop_target: IDropTarget = DragDropTarget::new(hwnd, handler).into();
     // WARNING: 同じHWNDに対して複数のDLLがRegisterDragDropを呼ぶと
     // 最後に登録したもののみが有効になります。これによりドラッグ&ドロップ
     // ハンドラが予期せず上書きされる可能性があります。
-    if unsafe { RevokeDragDrop(hwnd) } != Err(DRAGDROP_E_INVALIDHWND.into())
+    let revoke_result = unsafe { RevokeDragDrop(hwnd) };
+    log::debug!("[wry] RevokeDragDrop result: {:?}", revoke_result.is_ok());
+    
+    if revoke_result != Err(DRAGDROP_E_INVALIDHWND.into())
       && unsafe { RegisterDragDrop(hwnd, &drag_drop_target) }.is_ok()
     {
+      log::debug!("[wry] RegisterDragDrop successful for hwnd: {:?}", hwnd);
       self.drop_targets.push(drag_drop_target);
+    } else {
+      log::warn!("[wry] RegisterDragDrop failed for hwnd: {:?}", hwnd);
     }
 
     true

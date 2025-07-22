@@ -52,9 +52,12 @@ static PARENT_SUBCLASS_ID: Lazy<usize> = Lazy::new(|| generate_dll_unique_id("PA
 const PARENT_DESTROY_MESSAGE: u32 = WM_USER + 0x65;
 static MAIN_THREAD_DISPATCHER_SUBCLASS_ID: Lazy<usize> = Lazy::new(|| generate_dll_unique_id("DISPATCHER"));
 static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| {
+  log::debug!("[wry] Initializing EXEC_MSG_ID for DLL_SUFFIX: {}", DLL_SUFFIX);
   let msg_name = format!("Wry::ExecMsg::{}", DLL_SUFFIX);
   let msg_name_cstr = std::ffi::CString::new(msg_name).unwrap();
-  unsafe { RegisterWindowMessageA(PCSTR::from_raw(msg_name_cstr.as_ptr() as *const u8)) }
+  let id = unsafe { RegisterWindowMessageA(PCSTR::from_raw(msg_name_cstr.as_ptr() as *const u8)) };
+  log::debug!("[wry] EXEC_MSG_ID initialized: {} for {}", id, DLL_SUFFIX);
+  id
 });
 
 impl From<webview2_com::Error> for Error {
@@ -85,11 +88,19 @@ pub(crate) struct InnerWebView {
 
 impl Drop for InnerWebView {
   fn drop(&mut self) {
+    log::debug!("[wry] InnerWebView::drop - id: {}, is_child: {}, hwnd: {:?}, parent: {:?}", 
+      self.id, self.is_child, self.hwnd, *self.parent.borrow());
+    
     let _ = unsafe { self.controller.Close() };
     if self.is_child {
+      log::debug!("[wry] Destroying child window hwnd: {:?}", self.hwnd);
       let _ = unsafe { DestroyWindow(self.hwnd) };
+    } else {
+      log::debug!("[wry] Detaching parent subclass for hwnd: {:?}", *self.parent.borrow());
+      unsafe { Self::dettach_parent_subclass(*self.parent.borrow()) }
     }
-    unsafe { Self::dettach_parent_subclass(*self.parent.borrow()) }
+    
+    log::debug!("[wry] InnerWebView::drop completed - id: {}", self.id);
   }
 }
 
@@ -128,7 +139,9 @@ impl InnerWebView {
     pl_attrs: super::PlatformSpecificWebViewAttributes,
     is_child: bool,
   ) -> Result<Self> {
-    // COM初期化（既に初期化されている場合のエラーを無視）
+    log::debug!("[wry] InnerWebView::new_in_hwnd - parent: {:?}, is_child: {}", parent, is_child);
+    
+    // COM初期化（既に初期化されている場増のエラーを無視）
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if hr.is_ok() {
       // S_OK
@@ -139,6 +152,7 @@ impl InnerWebView {
     }
 
     let hwnd = Self::create_container_hwnd(parent, &attributes, is_child)?;
+    log::debug!("[wry] Created container hwnd: {:?}, parent: {:?}, is_child: {}", hwnd, parent, is_child);
 
     let drop_handler = attributes.drag_drop_handler.take();
     let bounds = attributes.bounds;
@@ -147,6 +161,8 @@ impl InnerWebView {
       .id
       .map(|id| id.to_string())
       .unwrap_or_else(|| (hwnd.0 as isize).to_string());
+    
+    log::debug!("[wry] Creating WebView - id: {}, dll_suffix: {}", id, DLL_SUFFIX);
 
     let background_color = if attributes.transparent {
       Some((0, 0, 0, 0))
@@ -565,7 +581,10 @@ impl InnerWebView {
 
     // Subclass parent for resizing and focus
     if !is_child {
+      log::debug!("[wry] Attaching parent subclass - parent: {:?}", parent);
       unsafe { Self::attach_parent_subclass(parent, controller) };
+    } else {
+      log::debug!("[wry] Skipping parent subclass (child mode)");
     }
 
     unsafe {
@@ -1135,6 +1154,7 @@ impl InnerWebView {
   }
 
   unsafe fn attach_main_thread_dispatcher(hwnd: HWND) {
+    log::debug!("[wry] Attaching main thread dispatcher - hwnd: {:?}, subclass_id: {}", hwnd, *MAIN_THREAD_DISPATCHER_SUBCLASS_ID);
     let _ = SetWindowSubclass(
       hwnd,
       Some(Self::main_thread_dispatcher_proc),
@@ -1234,6 +1254,7 @@ impl InnerWebView {
 
   #[inline]
   unsafe fn dettach_parent_subclass(parent: HWND) {
+    log::debug!("[wry] Detaching parent subclass - parent: {:?}, subclass_id: {}", parent, *PARENT_SUBCLASS_ID);
     SendMessageW(parent, PARENT_DESTROY_MESSAGE, None, None);
     let _ = RemoveWindowSubclass(
       parent,
