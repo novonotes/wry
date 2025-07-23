@@ -12,7 +12,7 @@ use std::{
 
 use dpi::{PhysicalPosition, PhysicalSize};
 use http::{Request, Response as HttpResponse, StatusCode};
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
@@ -39,6 +39,7 @@ const PARENT_SUBCLASS_ID: u32 = WM_USER + 0x64;
 const PARENT_DESTROY_MESSAGE: u32 = WM_USER + 0x65;
 const MAIN_THREAD_DISPATCHER_SUBCLASS_ID: u32 = WM_USER + 0x66;
 static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| unsafe { RegisterWindowMessageA(s!("Wry::ExecMsg")) });
+static WINDOW_CLASS_NAME: OnceCell<HSTRING> = OnceCell::new();
 
 impl From<webview2_com::Error> for Error {
   fn from(err: webview2_com::Error) -> Self {
@@ -197,7 +198,12 @@ impl InnerWebView {
       DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 
-    let class_name = w!("WRY_WEBVIEW");
+    // DLL 間の衝突を防ぐため、初回のWindow作成時のタイムスタンプを追加したクラス名を使用
+    let class_name = WINDOW_CLASS_NAME.get_or_init(|| {
+      let timestamp_suffix = util::get_timestamp_suffix();
+      let class_name_string = format!("WRY_WEBVIEW_{}", timestamp_suffix);
+      HSTRING::from(class_name_string)
+    });
 
     let class = WNDCLASSEXW {
       cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -210,7 +216,7 @@ impl InnerWebView {
       hCursor: HCURSOR::default(),
       hbrBackground: HBRUSH::default(),
       lpszMenuName: PCWSTR::null(),
-      lpszClassName: class_name,
+      lpszClassName: PCWSTR(class_name.as_ptr()),
       hIconSm: HICON::default(),
     };
 
@@ -245,7 +251,7 @@ impl InnerWebView {
     let hwnd = unsafe {
       CreateWindowExW(
         WINDOW_EX_STYLE::default(),
-        class_name,
+        PCWSTR(class_name.as_ptr()),
         PCWSTR::null(),
         window_styles,
         x,

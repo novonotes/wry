@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 use once_cell::sync::Lazy;
+use std::time::{SystemTime, UNIX_EPOCH};
 use windows::{
   core::{HRESULT, HSTRING, PCSTR},
   Win32::{
@@ -98,4 +99,30 @@ pub unsafe fn hwnd_dpi(hwnd: HWND) -> u32 {
       BASE_DPI
     }
   }
+}
+
+/// ミリ秒精度のタイムスタンプを大文字英数字で圧縮した文字列を返す
+pub fn get_timestamp_suffix() -> String {
+  const BASE36_CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+  let timestamp = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap()
+    .as_millis() as u64;
+
+  if timestamp == 0 {
+    return "0".to_string();
+  }
+
+  let mut result = Vec::new();
+  let mut num = timestamp;
+
+  while num > 0 {
+    let digit = (num % 36) as usize;
+    result.push(BASE36_CHARS[digit]);
+    num /= 36;
+  }
+
+  result.reverse();
+  String::from_utf8(result).unwrap()
 }
