@@ -6,6 +6,26 @@ fn main() {
   let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
   if target_os == "macos" || target_os == "ios" {
     println!("cargo:rustc-link-lib=framework=WebKit");
+
+    // ObjCクラス名のサフィックス処理
+    let suffix = match std::env::var("WRY_OBJC_SUFFIX") {
+      Ok(s) if !s.is_empty() => format!("_{}", s),
+      Ok(_) => String::new(),
+      Err(_) => {
+        // デバッグビルドではサフィックスなしを許可
+        let profile = std::env::var("PROFILE").unwrap_or_default();
+        if profile == "debug" {
+          String::new()
+        } else {
+          panic!(
+            "Environment variable WRY_OBJC_SUFFIX is not set. It's required in release build."
+          );
+        }
+      }
+    };
+
+    println!("cargo:rerun-if-env-changed=WRY_OBJC_SUFFIX");
+    set_objc_class_name_env(&suffix);
   }
 
   if target_os == "android" {
@@ -115,4 +135,35 @@ fn alias(alias: &str, condition: bool) {
   if condition {
     println!("cargo:rustc-cfg={alias}");
   }
+}
+
+fn set_objc_class_name_env(suffix: &str) {
+  println!(
+    "cargo:rustc-env=WRY_WEB_VIEW_CLASS_NAME=WryWebView{}",
+    suffix
+  );
+  println!(
+    "cargo:rustc-env=WRY_NAVIGATION_DELEGATE_CLASS_NAME=WryNavigationDelegate{}",
+    suffix
+  );
+  println!(
+    "cargo:rustc-env=WRY_DOWNLOAD_DELEGATE_CLASS_NAME=WryDownloadDelegate{}",
+    suffix
+  );
+  println!(
+    "cargo:rustc-env=WRY_WEB_VIEW_DELEGATE_CLASS_NAME=WryWebViewDelegate{}",
+    suffix
+  );
+  println!(
+    "cargo:rustc-env=WRY_WEB_VIEW_UI_DELEGATE_CLASS_NAME=WryWebViewUIDelegate{}",
+    suffix
+  );
+  println!(
+    "cargo:rustc-env=WRY_WEB_VIEW_PARENT_CLASS_NAME=WryWebViewParent{}",
+    suffix
+  );
+  println!(
+    "cargo:rustc-env=WRY_DOCUMENT_TITLE_CHANGED_OBSERVER_CLASS_NAME=DocumentTitleChangedObserver{}",
+    suffix
+  );
 }
