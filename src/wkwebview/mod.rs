@@ -328,9 +328,15 @@ impl InnerWebView {
 
       #[cfg(target_os = "macos")]
       let webview = {
-        let window = ns_view.window().unwrap();
-
-        let scale_factor = window.backingScaleFactor();
+        // AU プラグインの初期化時、親 NSView がまだウィンドウに追加されていない
+        // 状態で本関数が呼ばれる場合がある (clap-wrapper の AUv2 経路)。
+        // その場合は backingScaleFactor を取得できないため 1.0 にフォールバックする。
+        // bounds が Logical 単位であれば scale_factor は変換に影響しないため安全。
+        // 後続の AppKit のビュー階層昇格で実際の表示は正しい解像度になる。
+        let scale_factor = ns_view
+          .window()
+          .map(|w| w.backingScaleFactor())
+          .unwrap_or(1.0);
         let (x, y) = attributes
           .bounds
           .map(|b| b.position.to_logical::<f64>(scale_factor))
@@ -518,9 +524,10 @@ impl InnerWebView {
       webview.setUIDelegate(Some(proto_ui_delegate));
 
       // ns window is required for the print operation
+      // 親 NSView がまだウィンドウに追加されていない場合 (clap-wrapper の AUv2 経路など) は
+      // タイトルバースタイル設定はスキップする (パニックを回避)。
       #[cfg(target_os = "macos")]
-      {
-        let ns_window = ns_view.window().unwrap();
+      if let Some(ns_window) = ns_view.window() {
         let can_set_titlebar_style =
           ns_window.respondsToSelector(objc2::sel!(setTitlebarSeparatorStyle:));
         if can_set_titlebar_style {
@@ -892,18 +899,26 @@ r#"Object.defineProperty(window, 'ipc', {
   pub fn set_bounds(&self, #[allow(unused)] bounds: Rect) -> crate::Result<()> {
     #[cfg(target_os = "macos")]
     if self.is_child {
-      let window = self.webview.window().unwrap();
-      let scale_factor = window.backingScaleFactor();
+      // ウィンドウ未接続の場合は backingScaleFactor を取得できないので
+      // 1.0 にフォールバックする (Logical bounds なら影響なし)。
+      let scale_factor = self
+        .webview
+        .window()
+        .map(|w| w.backingScaleFactor())
+        .unwrap_or(1.0);
       let (x, y) = bounds.position.to_logical::<f64>(scale_factor).into();
       let (width, height) = bounds.size.to_logical::<i32>(scale_factor).into();
 
       unsafe {
-        let parent_view = self.webview.superview().unwrap();
-        let frame = CGRect {
-          origin: window_position(&parent_view, x, y, height),
-          size: CGSize::new(width, height),
-        };
-        self.webview.setFrame(frame);
+        // superview が無いタイミングで呼ばれた場合は frame 設定をスキップする
+        // (後で正しいタイミングで再度呼ばれる想定)。
+        if let Some(parent_view) = self.webview.superview() {
+          let frame = CGRect {
+            origin: window_position(&parent_view, x, y, height),
+            size: CGSize::new(width, height),
+          };
+          self.webview.setFrame(frame);
+        }
       }
     }
 
@@ -918,8 +933,12 @@ r#"Object.defineProperty(window, 'ipc', {
   pub fn focus(&self) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-      let window = self.webview.window().unwrap();
-      window.makeFirstResponder(Some(&self.webview));
+      // ウィンドウ未接続のタイミングでフォーカス要求が来た場合は何もしない。
+      // (実際にフォーカスできるのはウィンドウ階層に入ってからなので、この時点では
+      //  操作対象が存在しないだけと扱う)
+      if let Some(window) = self.webview.window() {
+        window.makeFirstResponder(Some(&self.webview));
+      }
     }
     Ok(())
   }
