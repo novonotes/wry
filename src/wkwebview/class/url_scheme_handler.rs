@@ -26,9 +26,12 @@ use objc2_web_kit::{WKURLSchemeHandler, WKURLSchemeTask};
 
 use crate::{wkwebview::WEBVIEW_STATE, RequestAsyncResponder, WryWebView};
 
-pub fn create(name: &str) -> &AnyClass {
+pub fn create(name: &str) -> &'static AnyClass {
   unsafe {
-    let scheme_name = format!("{}URLSchemeHandler\0", name);
+    // 各 dylib が自分の code/data segment に向く ObjC class を持つよう、
+    // グローバル状態のアドレスをクラス名に混ぜて一意化する。
+    let unique_id = std::ptr::addr_of!(WEBVIEW_STATE) as usize;
+    let scheme_name = format!("{}URLSchemeHandler_{:x}\0", name, unique_id);
     let scheme_name = CStr::from_bytes_with_nul(scheme_name.as_bytes()).unwrap();
     let cls = ClassBuilder::new(scheme_name, NSObject::class());
     match cls {
