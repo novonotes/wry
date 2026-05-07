@@ -541,7 +541,13 @@ impl InnerWebView {
       controller.SetIsVisible(attributes.visible)?;
 
       if attributes.focused {
-        controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)?;
+        if let Err(error) = controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC) {
+          // Cubase の VST3 子ウィンドウでは MoveFocus が E_INVALIDARG を返すことがある。
+          // WebView の作成自体は完了しているため、この場合だけ初期化失敗にしない。
+          if !is_child || error.code() != E_INVALIDARG {
+            return Err(error.into());
+          }
+        }
       }
     }
 
