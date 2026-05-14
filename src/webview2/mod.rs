@@ -6,7 +6,13 @@ mod drag_drop;
 mod util;
 
 use std::{
-  borrow::Cow, cell::RefCell, collections::HashSet, fmt::Write, fs, path::PathBuf, rc::Rc,
+  borrow::Cow,
+  cell::RefCell,
+  collections::{HashSet, VecDeque},
+  fmt::Write,
+  fs,
+  path::PathBuf,
+  rc::Rc,
   sync::mpsc,
 };
 
@@ -16,7 +22,7 @@ use once_cell::sync::{Lazy, OnceCell};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
-  core::{s, w, Interface, BOOL, HSTRING, PCWSTR, PWSTR},
+  core::{s, Interface, BOOL, HSTRING, PCWSTR, PWSTR},
   Win32::{
     Foundation::*,
     Globalization::*,
@@ -41,6 +47,14 @@ const MAIN_THREAD_DISPATCHER_SUBCLASS_ID: u32 = WM_USER + 0x66;
 static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| unsafe { RegisterWindowMessageA(s!("Wry::ExecMsg")) });
 static WINDOW_CLASS_NAME: OnceCell<HSTRING> = OnceCell::new();
 
+thread_local! {
+  // WebView2 finishes controller creation asynchronously through the same UI thread's message
+  // loop. Starting several creations at the same time makes the temporary native child-window
+  // association ambiguous, so let only one controller creation be outstanding per UI thread.
+  static WEBVIEW2_CONTROLLER_CREATION_QUEUE: RefCell<WebView2ControllerCreationQueue> =
+    RefCell::new(WebView2ControllerCreationQueue::default());
+}
+
 impl From<webview2_com::Error> for Error {
   fn from(err: webview2_com::Error) -> Self {
     Error::WebView2Error(err)
@@ -58,22 +72,72 @@ pub(crate) struct InnerWebView {
   parent: RefCell<HWND>,
   hwnd: HWND,
   is_child: bool,
-  pub controller: ICoreWebView2Controller,
-  webview: ICoreWebView2,
-  env: ICoreWebView2Environment,
+  state: Rc<RefCell<WebViewState>>,
+}
+
+#[derive(Default)]
+struct WebView2ControllerCreationQueue {
+  active: bool,
+  pending: VecDeque<Box<dyn FnOnce()>>,
+}
+
+struct WebViewState {
+  // `InnerWebView::new` returns before WebView2 has delivered its controller callback. This state
+  // is the bridge between wry's synchronous public API and WebView2's asynchronous creation model.
+  alive: bool,
+  visible: bool,
+  controller: Option<ICoreWebView2Controller>,
+  webview: Option<ICoreWebView2>,
+  env: Option<ICoreWebView2Environment>,
+  pending_bounds: Option<(PhysicalSize<i32>, PhysicalPosition<i32>)>,
+  pending_navigation: Option<PendingNavigation>,
   // Store FileDropController in here to make sure it gets dropped when
   // the webview gets dropped, otherwise we'll have a memory leak
   #[allow(dead_code)]
   drag_drop_controller: Option<DragDropController>,
 }
 
+enum PendingNavigation {
+  Url(String),
+  UrlWithHeaders(String, http::HeaderMap),
+  Html(String),
+}
+
+struct PendingWebViewCreation {
+  // Everything needed after WebView2's environment/controller callbacks. Keeping this as one
+  // payload makes the continuation explicit and avoids pumping nested host messages while waiting.
+  parent: HWND,
+  hwnd: HWND,
+  webview_id: String,
+  data_directory: Option<HSTRING>,
+  attributes: WebViewAttributes<'static>,
+  pl_attrs: super::PlatformSpecificWebViewAttributes,
+  is_child: bool,
+  drop_handler: Option<Box<dyn Fn(crate::DragDropEvent) -> bool>>,
+  background_color: Option<(u8, u8, u8, u8)>,
+  state: Rc<RefCell<WebViewState>>,
+}
+
 impl Drop for InnerWebView {
   fn drop(&mut self) {
-    let _ = unsafe { self.controller.Close() };
+    let controller = {
+      let mut state = self.state.borrow_mut();
+      state.alive = false;
+      state.webview = None;
+      state.env = None;
+      state.drag_drop_controller = None;
+      state.controller.take()
+    };
+
+    if let Some(controller) = controller {
+      let _ = unsafe { controller.Close() };
+    }
+
     if self.is_child {
       let _ = unsafe { DestroyWindow(self.hwnd) };
+    } else {
+      unsafe { Self::dettach_parent_subclass(*self.parent.borrow()) }
     }
-    unsafe { Self::dettach_parent_subclass(*self.parent.borrow()) }
   }
 }
 
@@ -129,39 +193,44 @@ impl InnerWebView {
     } else {
       attributes.background_color
     };
+    let data_directory = attributes
+      .context
+      .as_deref()
+      .and_then(|context| context.data_directory())
+      .map(HSTRING::from);
+    let attributes = Self::detach_attribute_lifetime(attributes);
 
-    let env = Self::create_environment(&attributes, pl_attrs.clone())?;
-    let controller = Self::create_controller(hwnd, &env, attributes.incognito, background_color)?;
-    let webview = Self::init_webview(
+    let visible = attributes.visible;
+    let state = Rc::new(RefCell::new(WebViewState {
+      alive: true,
+      visible,
+      controller: None,
+      webview: None,
+      env: None,
+      pending_bounds: None,
+      pending_navigation: None,
+      drag_drop_controller: None,
+    }));
+
+    Self::begin_create_environment(PendingWebViewCreation {
       parent,
       hwnd,
-      id.clone(),
+      webview_id: id.clone(),
+      data_directory,
       attributes,
-      &env,
-      &controller,
       pl_attrs,
       is_child,
-    )?;
-
-    let drag_drop_controller = drop_handler.map(|handler| {
-      // Disable file drops, so our handler can capture it
-      unsafe {
-        let _ = controller
-          .cast::<ICoreWebView2Controller4>()
-          .and_then(|c| c.SetAllowExternalDrop(false));
-      }
-      DragDropController::new(hwnd, handler)
-    });
+      drop_handler,
+      background_color,
+      state: state.clone(),
+    })?;
 
     let w = Self {
       id,
       parent: RefCell::new(parent),
       hwnd,
-      controller,
       is_child,
-      webview,
-      env,
-      drag_drop_controller,
+      state,
     };
 
     if is_child {
@@ -280,54 +349,64 @@ impl InnerWebView {
     Ok(hwnd)
   }
 
+  fn detach_attribute_lifetime(
+    mut attributes: WebViewAttributes<'_>,
+  ) -> WebViewAttributes<'static> {
+    attributes.id = None;
+    attributes.context = None;
+    // The only lifetime-carrying fields in WebViewAttributes are id and context, and both are
+    // cleared above before the attributes are moved into WebView2's asynchronous callbacks.
+    unsafe { std::mem::transmute::<WebViewAttributes<'_>, WebViewAttributes<'static>>(attributes) }
+  }
+
   #[inline]
-  fn create_environment(
-    attributes: &WebViewAttributes,
-    pl_attrs: super::PlatformSpecificWebViewAttributes,
-  ) -> Result<ICoreWebView2Environment> {
-    let data_directory = attributes
-      .context
-      .as_deref()
-      .and_then(|context| context.data_directory())
-      .map(HSTRING::from);
+  fn begin_create_environment(mut creation: PendingWebViewCreation) -> Result<()> {
+    // Do not wait here with `webview2_com::wait_with_pump`. In Windows Ableton Live, rapidly
+    // toggling an embedded plug-in editor can crash when a nested pump dispatches host GUI lifecycle
+    // callbacks while `set_parent`/`show` is still on the stack. Instead, return after scheduling
+    // the environment creation and continue from WebView2's completion callback.
+    let data_directory = creation.data_directory.take();
 
     // additional browser args
-    let additional_browser_args = pl_attrs.additional_browser_args.unwrap_or_else(|| {
-      // remove "mini menu" - See https://github.com/tauri-apps/wry/issues/535
-      // and "smart screen" - See https://github.com/tauri-apps/tauri/issues/1345
-      // enable white flicker fix
-      let default_args = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
-      let mut arguments = String::from(default_args);
+    let additional_browser_args = creation
+      .pl_attrs
+      .additional_browser_args
+      .take()
+      .unwrap_or_else(|| {
+        // remove "mini menu" - See https://github.com/tauri-apps/wry/issues/535
+        // and "smart screen" - See https://github.com/tauri-apps/tauri/issues/1345
+        // enable white flicker fix
+        let default_args = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
+        let mut arguments = String::from(default_args);
 
-      if attributes.autoplay {
-        arguments.push_str(" --autoplay-policy=no-user-gesture-required");
-      }
+        if creation.attributes.autoplay {
+          arguments.push_str(" --autoplay-policy=no-user-gesture-required");
+        }
 
-      if let Some(proxy_setting) = &attributes.proxy_config {
-        match proxy_setting {
-          ProxyConfig::Http(endpoint) => {
-            arguments.push_str(" --proxy-server=http://");
-            arguments.push_str(&endpoint.host);
-            arguments.push(':');
-            arguments.push_str(&endpoint.port);
-          }
-          ProxyConfig::Socks5(endpoint) => {
-            arguments.push_str(" --proxy-server=socks5://");
-            arguments.push_str(&endpoint.host);
-            arguments.push(':');
-            arguments.push_str(&endpoint.port);
-          }
-        };
-      }
+        if let Some(proxy_setting) = &creation.attributes.proxy_config {
+          match proxy_setting {
+            ProxyConfig::Http(endpoint) => {
+              arguments.push_str(" --proxy-server=http://");
+              arguments.push_str(&endpoint.host);
+              arguments.push(':');
+              arguments.push_str(&endpoint.port);
+            }
+            ProxyConfig::Socks5(endpoint) => {
+              arguments.push_str(" --proxy-server=socks5://");
+              arguments.push_str(&endpoint.host);
+              arguments.push(':');
+              arguments.push_str(&endpoint.port);
+            }
+          };
+        }
 
-      arguments
-    });
+        arguments
+      });
 
-    let (tx, rx) = mpsc::channel();
     let options = CoreWebView2EnvironmentOptions::default();
     unsafe {
       options.set_additional_browser_arguments(additional_browser_args);
-      options.set_are_browser_extensions_enabled(pl_attrs.browser_extensions_enabled);
+      options.set_are_browser_extensions_enabled(creation.pl_attrs.browser_extensions_enabled);
 
       // Get user's system language
       let lcid = GetUserDefaultUILanguage();
@@ -335,7 +414,7 @@ impl InnerWebView {
       LCIDToLocaleName(lcid as u32, Some(&mut lang), LOCALE_ALLOW_NEUTRAL_NAMES);
       options.set_language(String::from_utf16_lossy(&lang));
 
-      let scroll_bar_style = match pl_attrs.scroll_bar_style {
+      let scroll_bar_style = match creation.pl_attrs.scroll_bar_style {
         ScrollBarStyle::Default => COREWEBVIEW2_SCROLLBAR_STYLE_DEFAULT,
         ScrollBarStyle::FluentOverlay => COREWEBVIEW2_SCROLLBAR_STYLE_FLUENT_OVERLAY,
       };
@@ -346,70 +425,277 @@ impl InnerWebView {
         PCWSTR::null(),
         &data_directory.unwrap_or_default(),
         &ICoreWebView2EnvironmentOptions::from(options),
-        // we don't use CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async
-        // as it uses an mspc::channel under the hood, so we can avoid using two channels
-        // by manually creating the callback handler and use webview2_com::with_with_bump
         &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
           move |error_code, environment| {
-            error_code?;
-            tx.send(environment.ok_or_else(|| windows::core::Error::from(E_POINTER)))
-              .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
+            if let Err(error) = error_code {
+              Self::log_async_creation_error("environment", &error);
+              return Ok(());
+            }
+
+            let Some(environment) = environment else {
+              Self::log_async_creation_error("environment", &windows::core::Error::from(E_POINTER));
+              return Ok(());
+            };
+
+            Self::begin_create_controller(environment, creation);
+            Ok(())
           },
         )),
       )?;
     }
 
-    webview2_com::wait_with_pump(rx)?.map_err(Into::into)
+    Ok(())
   }
 
   #[inline]
-  fn create_controller(
-    hwnd: HWND,
-    env: &ICoreWebView2Environment,
-    incognito: bool,
-    background_color: Option<(u8, u8, u8, u8)>,
-  ) -> Result<ICoreWebView2Controller> {
-    let (tx, rx) = mpsc::channel();
-    let env = env.clone();
-    let env10 = env.cast::<ICoreWebView2Environment10>();
-
-    // we don't use CreateCoreWebView2ControllerCompletedHandler::wait_for_async
-    // as it uses an mspc::channel under the hood, so we can avoid using two channels
-    // by manually creating the callback handler and use webview2_com::with_with_bump
-    let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
-      move |error_code, controller| {
-        error_code?;
-        tx.send(controller.ok_or_else(|| windows::core::Error::from(E_POINTER)))
-          .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
-      },
-    ));
-
-    unsafe {
-      if let Ok(env10) = env10 {
-        let controller_opts = env10.CreateCoreWebView2ControllerOptions()?;
-
-        if let Some((r, g, b, mut a)) = background_color {
-          if let Ok(opts3) = controller_opts.cast::<ICoreWebView2ControllerOptions3>() {
-            if a != 0 {
-              a = 255;
-            }
-            opts3.SetDefaultBackgroundColor(COREWEBVIEW2_COLOR {
-              R: r,
-              G: g,
-              B: b,
-              A: a,
-            })?;
-          }
-        }
-
-        controller_opts.SetIsInPrivateModeEnabled(incognito)?;
-        env10.CreateCoreWebView2ControllerWithOptions(hwnd, &controller_opts, &handler)?;
-      } else {
-        env.CreateCoreWebView2Controller(hwnd, &handler)?
+  fn begin_create_controller(env: ICoreWebView2Environment, creation: PendingWebViewCreation) {
+    // Same rule as environment creation: starting the async WebView2 operation is synchronous, but
+    // finishing it must happen from the callback. The queue below prevents overlapping controller
+    // creation while still avoiding a nested message pump.
+    Self::enqueue_controller_creation(Box::new(move || {
+      if !creation.state.borrow().alive {
+        Self::complete_controller_creation();
+        return;
       }
+
+      let hwnd = creation.hwnd;
+      let incognito = creation.attributes.incognito;
+      let background_color = creation.background_color;
+      let env_for_callback = env.clone();
+      let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
+        move |error_code, controller| {
+          Self::complete_controller_creation();
+
+          if let Err(error) = error_code {
+            Self::log_async_creation_error("controller", &error);
+            return Ok(());
+          }
+
+          let Some(controller) = controller else {
+            Self::log_async_creation_error("controller", &windows::core::Error::from(E_POINTER));
+            return Ok(());
+          };
+
+          Self::finish_create_controller(env_for_callback.clone(), controller, creation);
+          Ok(())
+        },
+      ));
+
+      let result = unsafe {
+        if let Ok(env10) = env.cast::<ICoreWebView2Environment10>() {
+          match env10.CreateCoreWebView2ControllerOptions() {
+            Ok(controller_opts) => {
+              if let Some((r, g, b, mut a)) = background_color {
+                if let Ok(opts3) = controller_opts.cast::<ICoreWebView2ControllerOptions3>() {
+                  if a != 0 {
+                    a = 255;
+                  }
+                  if let Err(error) = opts3.SetDefaultBackgroundColor(COREWEBVIEW2_COLOR {
+                    R: r,
+                    G: g,
+                    B: b,
+                    A: a,
+                  }) {
+                    Self::complete_controller_creation();
+                    return Self::log_async_creation_error("controller options", &error);
+                  }
+                }
+              }
+
+              if let Err(error) = controller_opts.SetIsInPrivateModeEnabled(incognito) {
+                Self::complete_controller_creation();
+                return Self::log_async_creation_error("controller options", &error);
+              }
+
+              env10.CreateCoreWebView2ControllerWithOptions(hwnd, &controller_opts, &handler)
+            }
+            Err(error) => Err(error),
+          }
+        } else {
+          env.CreateCoreWebView2Controller(hwnd, &handler)
+        }
+      };
+
+      if let Err(error) = result {
+        Self::complete_controller_creation();
+        Self::log_async_creation_error("controller", &error);
+      }
+    }));
+  }
+
+  fn enqueue_controller_creation(task: Box<dyn FnOnce()>) {
+    let task = WEBVIEW2_CONTROLLER_CREATION_QUEUE.with(|queue| {
+      let mut queue = queue.borrow_mut();
+      if queue.active {
+        queue.pending.push_back(task);
+        None
+      } else {
+        queue.active = true;
+        Some(task)
+      }
+    });
+
+    if let Some(task) = task {
+      task();
+    }
+  }
+
+  fn complete_controller_creation() {
+    let task = WEBVIEW2_CONTROLLER_CREATION_QUEUE.with(|queue| {
+      let mut queue = queue.borrow_mut();
+      if let Some(task) = queue.pending.pop_front() {
+        Some(task)
+      } else {
+        queue.active = false;
+        None
+      }
+    });
+
+    if let Some(task) = task {
+      task();
+    }
+  }
+
+  fn log_async_creation_error(context: &str, error: &windows::core::Error) {
+    let _ = (context, error);
+    #[cfg(feature = "tracing")]
+    tracing::error!("WebView2 async {context} creation failed: {error:?}");
+    #[cfg(debug_assertions)]
+    eprintln!("WebView2 async {context} creation failed: {error:?}");
+  }
+
+  fn finish_create_controller(
+    env: ICoreWebView2Environment,
+    controller: ICoreWebView2Controller,
+    mut creation: PendingWebViewCreation,
+  ) {
+    // If the Rust-side WebView was dropped before WebView2 answered, close the late controller and
+    // deliberately skip the rest of initialization. This is the normal cancellation path for rapid
+    // create/destroy cycles in hosts.
+    if !creation.state.borrow().alive {
+      let _ = unsafe { controller.Close() };
+      return;
     }
 
-    webview2_com::wait_with_pump(rx)?.map_err(Into::into)
+    creation.attributes.visible = creation.state.borrow().visible;
+
+    let webview = match Self::init_webview(
+      creation.parent,
+      creation.hwnd,
+      creation.webview_id,
+      creation.attributes,
+      &env,
+      &controller,
+      creation.pl_attrs,
+      creation.is_child,
+    ) {
+      Ok(webview) => webview,
+      Err(error) => {
+        let _ = &error;
+        #[cfg(feature = "tracing")]
+        tracing::error!("WebView2 initialization failed after controller creation: {error:?}");
+        #[cfg(debug_assertions)]
+        eprintln!("WebView2 initialization failed after controller creation: {error:?}");
+        let _ = unsafe { controller.Close() };
+        return;
+      }
+    };
+
+    let drag_drop_controller = creation.drop_handler.map(|handler| {
+      // Disable file drops, so our handler can capture it
+      unsafe {
+        let _ = controller
+          .cast::<ICoreWebView2Controller4>()
+          .and_then(|c| c.SetAllowExternalDrop(false));
+      }
+      DragDropController::new(creation.hwnd, handler)
+    });
+
+    let (pending_bounds, pending_navigation, visible) = {
+      let mut state = creation.state.borrow_mut();
+      if !state.alive {
+        drop(state);
+        let _ = unsafe { controller.Close() };
+        return;
+      }
+
+      state.env = Some(env.clone());
+      state.controller = Some(controller.clone());
+      state.webview = Some(webview.clone());
+      state.drag_drop_controller = drag_drop_controller;
+      (
+        state.pending_bounds.take(),
+        state.pending_navigation.take(),
+        state.visible,
+      )
+    };
+
+    unsafe {
+      let _ = ShowWindow(
+        creation.hwnd,
+        match visible {
+          true => SW_SHOW,
+          false => SW_HIDE,
+        },
+      );
+      let _ = controller.SetIsVisible(visible);
+    }
+
+    if let Some((size, position)) = pending_bounds {
+      let _ = Self::apply_bounds(creation.hwnd, &controller, size, position);
+    }
+
+    if let Some(navigation) = pending_navigation {
+      let _ = Self::apply_navigation(&env, &webview, navigation);
+    }
+  }
+
+  fn apply_bounds(
+    hwnd: HWND,
+    controller: &ICoreWebView2Controller,
+    size: PhysicalSize<i32>,
+    position: PhysicalPosition<i32>,
+  ) -> Result<()> {
+    unsafe {
+      controller.SetBounds(RECT {
+        top: 0,
+        left: 0,
+        right: size.width,
+        bottom: size.height,
+      })?;
+
+      SetWindowPos(
+        hwnd,
+        None,
+        position.x,
+        position.y,
+        size.width,
+        size.height,
+        SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER,
+      )?;
+    }
+
+    Ok(())
+  }
+
+  fn apply_navigation(
+    env: &ICoreWebView2Environment,
+    webview: &ICoreWebView2,
+    navigation: PendingNavigation,
+  ) -> Result<()> {
+    match navigation {
+      PendingNavigation::Url(url) => {
+        let url = HSTRING::from(url);
+        unsafe { webview.Navigate(&url) }.map_err(Into::into)
+      }
+      PendingNavigation::UrlWithHeaders(url, headers) => {
+        load_url_with_headers(webview, env, &url, headers)
+      }
+      PendingNavigation::Html(html) => {
+        let html = HSTRING::from(html);
+        unsafe { webview.NavigateToString(&html) }.map_err(Into::into)
+      }
+    }
   }
 
   #[inline]
@@ -1219,17 +1505,16 @@ impl InnerWebView {
 
   #[inline]
   fn add_script_to_execute_on_document_created(webview: &ICoreWebView2, js: String) -> Result<()> {
-    let webview = webview.clone();
-    AddScriptToExecuteOnDocumentCreatedCompletedHandler::wait_for_async_operation(
-      Box::new(move |handler| unsafe {
-        let js = HSTRING::from(js);
-        webview
-          .AddScriptToExecuteOnDocumentCreated(&js, &handler)
-          .map_err(Into::into)
-      }),
-      Box::new(|e, _| e),
-    )
-    .map_err(Into::into)
+    unsafe {
+      webview.AddScriptToExecuteOnDocumentCreated(
+        &HSTRING::from(js),
+        &AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|error_code, _| {
+          error_code
+        })),
+      )?;
+    }
+
+    Ok(())
   }
 
   #[inline]
@@ -1287,43 +1572,86 @@ impl InnerWebView {
     &self.id
   }
 
+  pub fn controller(&self) -> Option<ICoreWebView2Controller> {
+    // Controller creation is asynchronous on Windows now. Callers that need the raw WebView2
+    // controller must handle the not-yet-created state instead of assuming construction is complete.
+    self.state.borrow().controller.clone()
+  }
+
   pub fn eval(
     &self,
     js: &str,
     callback: Option<impl FnOnce(String) + Send + 'static>,
   ) -> Result<()> {
-    if let Some(callback) = callback {
-      Self::execute_script(&self.webview, js, callback)?
-    } else {
-      Self::execute_script(&self.webview, js, |_| ())?
+    if let Some(webview) = self.state.borrow().webview.clone() {
+      if let Some(callback) = callback {
+        Self::execute_script(&webview, js, callback)?
+      } else {
+        Self::execute_script(&webview, js, |_| ())?
+      }
     }
     Ok(())
   }
 
   pub fn url(&self) -> Result<String> {
-    Self::url_from_webview(&self.webview).map_err(Into::into)
+    if let Some(webview) = self.state.borrow().webview.clone() {
+      Self::url_from_webview(&webview).map_err(Into::into)
+    } else {
+      Ok(String::new())
+    }
   }
 
   pub fn zoom(&self, scale_factor: f64) -> Result<()> {
-    unsafe { self.controller.SetZoomFactor(scale_factor) }.map_err(Into::into)
+    if let Some(controller) = self.state.borrow().controller.clone() {
+      unsafe { controller.SetZoomFactor(scale_factor) }.map_err(Into::into)
+    } else {
+      Ok(())
+    }
   }
 
   pub fn load_url(&self, url: &str) -> Result<()> {
-    let url = HSTRING::from(url);
-    unsafe { self.webview.Navigate(&url) }.map_err(Into::into)
+    if let Some(webview) = self.state.borrow().webview.clone() {
+      let url = HSTRING::from(url);
+      unsafe { webview.Navigate(&url) }.map_err(Into::into)
+    } else {
+      // Navigation requested before the controller callback should apply to the first real WebView,
+      // not fail spuriously because creation is still pending.
+      self.state.borrow_mut().pending_navigation = Some(PendingNavigation::Url(url.to_string()));
+      Ok(())
+    }
   }
 
   pub fn load_url_with_headers(&self, url: &str, headers: http::HeaderMap) -> Result<()> {
-    load_url_with_headers(&self.webview, &self.env, url, headers)
+    let (env, webview) = {
+      let state = self.state.borrow();
+      (state.env.clone(), state.webview.clone())
+    };
+
+    if let (Some(env), Some(webview)) = (env, webview) {
+      load_url_with_headers(&webview, &env, url, headers)
+    } else {
+      self.state.borrow_mut().pending_navigation =
+        Some(PendingNavigation::UrlWithHeaders(url.to_string(), headers));
+      Ok(())
+    }
   }
 
   pub fn load_html(&self, html: &str) -> Result<()> {
-    let html = HSTRING::from(html);
-    unsafe { self.webview.NavigateToString(&html) }.map_err(Into::into)
+    if let Some(webview) = self.state.borrow().webview.clone() {
+      let html = HSTRING::from(html);
+      unsafe { webview.NavigateToString(&html) }.map_err(Into::into)
+    } else {
+      self.state.borrow_mut().pending_navigation = Some(PendingNavigation::Html(html.to_string()));
+      Ok(())
+    }
   }
 
   pub fn reload(&self) -> Result<()> {
-    unsafe { self.webview.Reload() }.map_err(Into::into)
+    if let Some(webview) = self.state.borrow().webview.clone() {
+      unsafe { webview.Reload() }.map_err(Into::into)
+    } else {
+      Ok(())
+    }
   }
 
   pub fn bounds(&self) -> Result<Rect> {
@@ -1339,8 +1667,10 @@ impl InnerWebView {
       unsafe { MapWindowPoints(Some(self.hwnd), Some(*self.parent.borrow()), position_point) };
 
       bounds.position = PhysicalPosition::new(position_point[0].x, position_point[0].y).into();
+    } else if let Some(controller) = self.state.borrow().controller.clone() {
+      unsafe { controller.Bounds(&mut rect) }?;
     } else {
-      unsafe { self.controller.Bounds(&mut rect) }?;
+      unsafe { GetClientRect(self.hwnd, &mut rect)? };
     }
 
     bounds.size = PhysicalSize::new(rect.right - rect.left, rect.bottom - rect.top).into();
@@ -1353,14 +1683,15 @@ impl InnerWebView {
     size: PhysicalSize<i32>,
     position: PhysicalPosition<i32>,
   ) -> Result<()> {
-    unsafe {
-      self.controller.SetBounds(RECT {
-        top: 0,
-        left: 0,
-        right: size.width,
-        bottom: size.height,
-      })?;
+    if let Some(controller) = self.state.borrow().controller.clone() {
+      return Self::apply_bounds(self.hwnd, &controller, size, position);
+    }
 
+    // Hosts can resize immediately after `new_as_child`, before the controller exists. Move the
+    // container HWND now so the host sees the right bounds, then apply the WebView2 bounds once the
+    // controller callback arrives.
+    self.state.borrow_mut().pending_bounds = Some((size, position));
+    unsafe {
       SetWindowPos(
         self.hwnd,
         None,
@@ -1390,6 +1721,12 @@ impl InnerWebView {
   }
 
   pub fn set_visible(&self, visible: bool) -> Result<()> {
+    let controller = {
+      let mut state = self.state.borrow_mut();
+      state.visible = visible;
+      state.controller.clone()
+    };
+
     unsafe {
       let _ = ShowWindow(
         self.hwnd,
@@ -1399,18 +1736,23 @@ impl InnerWebView {
         },
       );
 
-      self.controller.SetIsVisible(visible)?;
+      if let Some(controller) = controller {
+        controller.SetIsVisible(visible)?;
+      }
     }
 
     Ok(())
   }
 
   pub fn focus(&self) -> Result<()> {
-    unsafe {
-      self
-        .controller
-        .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)
-        .map_err(Into::into)
+    if let Some(controller) = self.state.borrow().controller.clone() {
+      unsafe {
+        controller
+          .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)
+          .map_err(Into::into)
+      }
+    } else {
+      Ok(())
     }
   }
 
@@ -1493,7 +1835,10 @@ impl InnerWebView {
   fn cookies_inner(&self, uri: PCWSTR) -> Result<Vec<cookie::Cookie<'static>>> {
     let (tx, rx) = mpsc::channel();
 
-    let webview = self.webview.cast::<ICoreWebView2_2>()?;
+    let Some(webview) = self.state.borrow().webview.clone() else {
+      return Ok(Vec::new());
+    };
+    let webview = webview.cast::<ICoreWebView2_2>()?;
     unsafe {
       webview.CookieManager()?.GetCookies(
         uri,
@@ -1539,7 +1884,9 @@ impl InnerWebView {
 
       if !self.is_child {
         Self::dettach_parent_subclass(*self.parent.borrow());
-        Self::attach_parent_subclass(parent, &self.controller);
+        if let Some(controller) = self.state.borrow().controller.clone() {
+          Self::attach_parent_subclass(parent, &controller);
+        }
 
         *self.parent.borrow_mut() = parent;
 
@@ -1560,29 +1907,43 @@ impl InnerWebView {
   }
 
   pub fn clear_all_browsing_data(&self) -> Result<()> {
-    unsafe {
-      self
-        .webview
-        .cast::<ICoreWebView2_13>()?
-        .Profile()?
-        .cast::<ICoreWebView2Profile2>()?
-        .ClearBrowsingDataAll(&ClearBrowsingDataCompletedHandler::create(Box::new(
-          move |_| Ok(()),
-        )))
-        .map_err(Into::into)
+    if let Some(webview) = self.state.borrow().webview.clone() {
+      unsafe {
+        webview
+          .cast::<ICoreWebView2_13>()?
+          .Profile()?
+          .cast::<ICoreWebView2Profile2>()?
+          .ClearBrowsingDataAll(&ClearBrowsingDataCompletedHandler::create(Box::new(
+            move |_| Ok(()),
+          )))
+          .map_err(Into::into)
+      }
+    } else {
+      Ok(())
     }
   }
 
   pub fn set_theme(&self, theme: Theme) -> Result<()> {
-    unsafe { set_theme(&self.webview, theme) }
+    if let Some(webview) = self.state.borrow().webview.clone() {
+      unsafe { set_theme(&webview, theme) }
+    } else {
+      Ok(())
+    }
   }
 
   pub fn set_background_color(&self, background_color: RGBA) -> Result<()> {
-    unsafe { set_background_color(&self.controller, background_color) }
+    if let Some(controller) = self.state.borrow().controller.clone() {
+      unsafe { set_background_color(&controller, background_color) }
+    } else {
+      Ok(())
+    }
   }
 
   pub fn set_memory_usage_level(&self, level: MemoryUsageLevel) -> Result<()> {
-    let webview = self.webview.cast::<ICoreWebView2_19>()?;
+    let Some(webview) = self.state.borrow().webview.clone() else {
+      return Ok(());
+    };
+    let webview = webview.cast::<ICoreWebView2_19>()?;
     // https://learn.microsoft.com/en-us/dotnet/api/microsoft.web.webview2.core.corewebview2memoryusagetargetlevel
     let level = match level {
       MemoryUsageLevel::Normal => 0,
@@ -1594,7 +1955,9 @@ impl InnerWebView {
 
   #[cfg(any(debug_assertions, feature = "devtools"))]
   pub fn open_devtools(&self) {
-    let _ = unsafe { self.webview.OpenDevToolsWindow() };
+    if let Some(webview) = self.state.borrow().webview.clone() {
+      let _ = unsafe { webview.OpenDevToolsWindow() };
+    }
   }
 
   #[cfg(any(debug_assertions, feature = "devtools"))]
