@@ -2000,7 +2000,7 @@ pub enum MemoryUsageLevel {
 #[cfg(target_os = "windows")]
 pub trait WebViewExtWindows {
   /// Returns WebView2 Controller
-  fn controller(&self) -> ICoreWebView2Controller;
+  fn controller(&self) -> Option<ICoreWebView2Controller>;
 
   /// Changes the webview2 theme.
   ///
@@ -2028,8 +2028,8 @@ pub trait WebViewExtWindows {
 
 #[cfg(target_os = "windows")]
 impl WebViewExtWindows for WebView {
-  fn controller(&self) -> ICoreWebView2Controller {
-    self.webview.controller.clone()
+  fn controller(&self) -> Option<ICoreWebView2Controller> {
+    self.webview.controller()
   }
 
   fn set_theme(&self, theme: Theme) -> Result<()> {
